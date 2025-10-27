@@ -43,3 +43,61 @@ const logger = {
     warn: (message, meta = {}) => console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, meta),
     error: (message, meta = {}) => console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, meta)
 };
+
+
+// Create circuit breakers for each service
+
+class CircuitBreakerFactory {
+    constructor(options) {
+        this.defaultOptions = options;
+    }
+
+    create(serviceName) {
+        const circuit = new CircuitBreaker(this.createRequestFunction(), {
+            ...this.defaultOptions,
+            name: serviceName
+        });
+
+        circuit.fallback(() => this.createFallbackResponse(serviceName));
+        this.setupEventListeners(circuit, serviceName);
+        
+        return circuit;
+    }
+
+    createRequestFunction() {
+        return async (url, options = {}) => {
+            try {
+                const response = await axios({
+                    url,
+                    ...options,
+                    validateStatus: status => (status >= 200 && status < 300) || status === 404,
+                    timeout: config.circuitBreaker.timeout
+                });
+                return response.data;
+            } catch (error) {
+                if (error.response && error.response.status === 404) {
+                    return error.response.data;
+                }
+                throw error;
+            }
+        };
+    }
+
+    createFallbackResponse(serviceName) {
+        return {
+            error: `${serviceName} service temporarily unavailable`,
+            timestamp: new Date().toISOString()
+        };
+    }
+
+    setupEventListeners(circuit, serviceName) {
+        circuit.on('open', () => 
+            logger.warn(`Circuit breaker for ${serviceName} opened`));
+        circuit.on('close', () => 
+            logger.info(`Circuit breaker for ${serviceName} closed`));
+        circuit.on('halfOpen', () => 
+            logger.info(`Circuit breaker for ${serviceName} half-open`));
+        circuit.on('failure', (error) => 
+            logger.error(`Circuit breaker for ${serviceName} failure:`, error));
+    }
+}
