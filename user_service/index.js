@@ -8,7 +8,7 @@ const Joi = require("joi");
 
 const app = express();
 const PORT = process.env.PORT || 8000;
-
+// Конфигурация
 const config = {
   services: {
     users: {
@@ -31,3 +31,8 @@ const config = {
     max: 100, // максимум 100 запросов за окно
   },
 };
+// Middleware
+app.use(helmet());
+app.use(cors());
+app.use(express.json());
+app.use(rateLimit(config.rateLimit));
