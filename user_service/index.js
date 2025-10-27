@@ -36,3 +36,10 @@ app.use(helmet());
 app.use(cors());
 app.use(express.json());
 app.use(rateLimit(config.rateLimit));
+
+// Логирование
+const logger = {
+    info: (message, meta = {}) => console.log(`[INFO] ${new Date().toISOString()} - ${message}`, meta),
+    warn: (message, meta = {}) => console.warn(`[WARN] ${new Date().toISOString()} - ${message}`, meta),
+    error: (message, meta = {}) => console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, meta)
+};
