@@ -101,3 +101,7 @@ class CircuitBreakerFactory {
             logger.error(`Circuit breaker for ${serviceName} failure:`, error));
     }
 }
+
+app.listen(PORT, () => {
+    logger.info(`API Gateway running on port ${PORT}`);
+});
