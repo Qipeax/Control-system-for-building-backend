@@ -157,52 +157,86 @@ class UserService extends BaseService {
 
 // Сервис заказов
 class OrderService extends BaseService {
-    constructor(circuitBreaker, baseUrl) {
-        super('orders', baseUrl, circuitBreaker);
-    }
+  constructor(circuitBreaker, baseUrl) {
+    super("orders", baseUrl, circuitBreaker);
+  }
 
-    async getOrder(orderId) {
-        return this.request(`/orders/${orderId}`);
-    }
+  async getOrder(orderId) {
+    return this.request(`/orders/${orderId}`);
+  }
 
-    async createOrder(orderData) {
-        return this.request('/orders', {
-            method: 'POST',
-            data: orderData
-        });
-    }
+  async createOrder(orderData) {
+    return this.request("/orders", {
+      method: "POST",
+      data: orderData,
+    });
+  }
 
-    async getOrders() {
-        return this.request('/orders');
-    }
+  async getOrders() {
+    return this.request("/orders");
+  }
 
-    async getOrdersByUserId(userId) {
-        const allOrders = await this.getOrders();
-        return allOrders.filter(order => order.userId == userId);
-    }
+  async getOrdersByUserId(userId) {
+    const allOrders = await this.getOrders();
+    return allOrders.filter((order) => order.userId == userId);
+  }
 
-    async updateOrder(orderId, orderData) {
-        return this.request(`/orders/${orderId}`, {
-            method: 'PUT',
-            data: orderData
-        });
-    }
+  async updateOrder(orderId, orderData) {
+    return this.request(`/orders/${orderId}`, {
+      method: "PUT",
+      data: orderData,
+    });
+  }
 
-    async deleteOrder(orderId) {
-        return this.request(`/orders/${orderId}`, {
-            method: 'DELETE'
-        });
-    }
+  async deleteOrder(orderId) {
+    return this.request(`/orders/${orderId}`, {
+      method: "DELETE",
+    });
+  }
 
-    async getStatus() {
-        return this.request('/orders/status');
-    }
+  async getStatus() {
+    return this.request("/orders/status");
+  }
 
-    async getHealth() {
-        return this.request('/orders/health');
-    }
+  async getHealth() {
+    return this.request("/orders/health");
+  }
 }
 
+// Валидация
+const userSchema = Joi.object({
+  name: Joi.string().min(1).max(100).required(),
+  email: Joi.string().email().required(),
+  age: Joi.number().integer().min(0).max(150).optional(),
+});
+
+const orderSchema = Joi.object({
+  userId: Joi.string().required(),
+  product: Joi.string().min(1).max(255).required(),
+  quantity: Joi.number().integer().min(1).required(),
+  price: Joi.number().min(0).precision(2).required(),
+});
+
+const validate = (schema) => (req, res, next) => {
+  const { error } = schema.validate(req.body);
+  if (error) {
+    return res.status(400).json({
+      error: "Validation failed",
+      details: error.details.map((detail) => detail.message),
+    });
+  }
+  next();
+};
+
+const validateId = (req, res, next) => {
+  const id = req.params.userId || req.params.orderId;
+  if (!id || !/^[a-zA-Z0-9-_]+$/.test(id)) {
+    return res.status(400).json({
+      error: "Invalid ID format",
+    });
+  }
+  next();
+};
 
 // Глобальная обработка ошибок
 app.use(errorHandler);
