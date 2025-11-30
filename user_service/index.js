@@ -155,6 +155,55 @@ class UserService extends BaseService {
   }
 }
 
+// Сервис заказов
+class OrderService extends BaseService {
+    constructor(circuitBreaker, baseUrl) {
+        super('orders', baseUrl, circuitBreaker);
+    }
+
+    async getOrder(orderId) {
+        return this.request(`/orders/${orderId}`);
+    }
+
+    async createOrder(orderData) {
+        return this.request('/orders', {
+            method: 'POST',
+            data: orderData
+        });
+    }
+
+    async getOrders() {
+        return this.request('/orders');
+    }
+
+    async getOrdersByUserId(userId) {
+        const allOrders = await this.getOrders();
+        return allOrders.filter(order => order.userId == userId);
+    }
+
+    async updateOrder(orderId, orderData) {
+        return this.request(`/orders/${orderId}`, {
+            method: 'PUT',
+            data: orderData
+        });
+    }
+
+    async deleteOrder(orderId) {
+        return this.request(`/orders/${orderId}`, {
+            method: 'DELETE'
+        });
+    }
+
+    async getStatus() {
+        return this.request('/orders/status');
+    }
+
+    async getHealth() {
+        return this.request('/orders/health');
+    }
+}
+
+
 // Глобальная обработка ошибок
 app.use(errorHandler);
 // Обработка страницы 404
