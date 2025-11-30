@@ -424,6 +424,24 @@ app.get('/users/:userId/details', validateId, async (req, res, next) => {
     }
 });
 
+// Health check
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'API Gateway is running',
+        timestamp: new Date().toISOString(),
+        environment: process.env.NODE_ENV || 'development',
+        circuits: {
+            users: userService.circuit.status,
+            orders: orderService.circuit.status
+        }
+    });
+});
+
+app.get('/status', (req, res) => {
+    res.json({ status: 'API Gateway is running' });
+});
+
+
 // Глобальная обработка ошибок
 app.use(errorHandler);
 // Обработка страницы 404
