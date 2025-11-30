@@ -27,8 +27,8 @@ const config = {
     resetTimeout: parseInt(process.env.CIRCUIT_RESET_TIMEOUT) || 30000,
   },
   rateLimit: {
-    windowMs: 15 * 60 * 1000, // 15 минут
-    max: 100, // максимум 100 запросов за окно
+    windowMs: 15 * 60 * 1000,
+    max: 100,
   },
 };
 // Middleware
@@ -47,8 +47,7 @@ const logger = {
     console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, meta),
 };
 
-// Create circuit breakers for each service
-
+// Фабрика Circuit Breaker'ов
 class CircuitBreakerFactory {
   constructor(options) {
     this.defaultOptions = options;
@@ -85,30 +84,79 @@ class CircuitBreakerFactory {
       }
     };
   }
+}
 
-  createFallbackResponse(serviceName) {
-    return {
-      error: `${serviceName} service temporarily unavailable`,
-      timestamp: new Date().toISOString(),
-    };
+// Базовый сервис
+class BaseService {
+  constructor(serviceName, baseUrl, circuitBreaker) {
+    this.serviceName = serviceName;
+    this.baseUrl = baseUrl;
+    this.circuit = circuitBreaker;
   }
 
-  setupEventListeners(circuit, serviceName) {
-    circuit.on("open", () =>
-      logger.warn(`Circuit breaker for ${serviceName} opened`)
-    );
-    circuit.on("close", () =>
-      logger.info(`Circuit breaker for ${serviceName} closed`)
-    );
-    circuit.on("halfOpen", () =>
-      logger.info(`Circuit breaker for ${serviceName} half-open`)
-    );
-    circuit.on("failure", (error) =>
-      logger.error(`Circuit breaker for ${serviceName} failure:`, error)
-    );
+  async request(endpoint, options = {}) {
+    try {
+      const url = `${this.baseUrl}${endpoint}`;
+      return await this.circuit.fire(url, options);
+    } catch (error) {
+      throw this.handleError(error);
+    }
+  }
+
+  handleError(error) {
+    if (error.response) {
+      return {
+        status: error.response.status,
+        message: error.response.data?.error || "Service error",
+        details: error.response.data,
+      };
+    }
+
+    return {
+      status: 500,
+      message: "Internal server error",
+      details: error.message,
+    };
   }
 }
 
+// Сервис пользователей
+class UserService extends BaseService {
+  constructor(circuitBreaker, baseUrl) {
+    super("users", baseUrl, circuitBreaker);
+  }
+
+  async getUser(userId) {
+    return this.request(`/users/${userId}`);
+  }
+
+  async createUser(userData) {
+    return this.request("/users", {
+      method: "POST",
+      data: userData,
+    });
+  }
+
+  async getUsers() {
+    return this.request("/users");
+  }
+
+  async updateUser(userId, userData) {
+    return this.request(`/users/${userId}`, {
+      method: "PUT",
+      data: userData,
+    });
+  }
+
+  async deleteUser(userId) {
+    return this.request(`/users/${userId}`, {
+      method: "DELETE",
+    });
+  }
+}
+
+// Глобальная обработка ошибок
+app.use(errorHandler);
 // Обработка страницы 404
 
 app.use("*", (req, res) => {
