@@ -237,6 +237,61 @@ const validateId = (req, res, next) => {
   }
   next();
 };
+// Обработка ошибок
+const errorHandler = (error, req, res, next) => {
+  logger.error("Unhandled error:", {
+    error: error.message,
+    stack: error.stack,
+    url: req.url,
+    method: req.method,
+  });
+
+  if (error.status) {
+    return res.status(error.status).json({
+      error: error.message,
+      ...(error.details && { details: error.details }),
+    });
+  }
+
+  if (error.message && error.message.includes("circuit")) {
+    return res.status(503).json({
+      error: "Service temporarily unavailable",
+      timestamp: new Date().toISOString(),
+    });
+  }
+
+  res.status(500).json({
+    error: "Internal server error",
+    timestamp: new Date().toISOString(),
+  });
+};
+
+// Инициализация сервисов
+const circuitFactory = new CircuitBreakerFactory(config.circuitBreaker);
+
+const userService = new UserService(
+    circuitFactory.create('users'),
+    config.services.users.url
+);
+
+const orderService = new OrderService(
+    circuitFactory.create('orders'),
+    config.services.orders.url
+);
+
+// Маршруты для пользователей
+app.get('/users/:userId', validateId, async (req, res, next) => {
+    try {
+        const user = await userService.getUser(req.params.userId);
+        if (user.error === 'User not found') {
+            res.status(404).json(user);
+        } else {
+            res.json(user);
+        }
+    } catch (error) {
+        next(error);
+    }
+});
 
 // Глобальная обработка ошибок
 app.use(errorHandler);
