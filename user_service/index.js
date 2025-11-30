@@ -293,6 +293,137 @@ app.get('/users/:userId', validateId, async (req, res, next) => {
     }
 });
 
+app.post('/users', validate(userSchema), async (req, res, next) => {
+    try {
+        const user = await userService.createUser(req.body);
+        res.status(201).json(user);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/users', async (req, res, next) => {
+    try {
+        const users = await userService.getUsers();
+        res.json(users);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.put('/users/:userId', validateId, validate(userSchema), async (req, res, next) => {
+    try {
+        const user = await userService.updateUser(req.params.userId, req.body);
+        res.json(user);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.delete('/users/:userId', validateId, async (req, res, next) => {
+    try {
+        const result = await userService.deleteUser(req.params.userId);
+        res.json(result);
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Маршруты для заказов
+app.get('/orders/:orderId', validateId, async (req, res, next) => {
+    try {
+        const order = await orderService.getOrder(req.params.orderId);
+        if (order.error === 'Order not found') {
+            res.status(404).json(order);
+        } else {
+            res.json(order);
+        }
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.post('/orders', validate(orderSchema), async (req, res, next) => {
+    try {
+        const order = await orderService.createOrder(req.body);
+        res.status(201).json(order);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/orders', async (req, res, next) => {
+    try {
+        const orders = await orderService.getOrders();
+        res.json(orders);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.delete('/orders/:orderId', validateId, async (req, res, next) => {
+    try {
+        const result = await orderService.deleteOrder(req.params.orderId);
+        res.json(result);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.put('/orders/:orderId', validateId, validate(orderSchema), async (req, res, next) => {
+    try {
+        const order = await orderService.updateOrder(req.params.orderId, req.body);
+        res.json(order);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/orders/status', async (req, res, next) => {
+    try {
+        const status = await orderService.getStatus();
+        res.json(status);
+    } catch (error) {
+        next(error);
+    }
+});
+
+app.get('/orders/health', async (req, res, next) => {
+    try {
+        const health = await orderService.getHealth();
+        res.json(health);
+    } catch (error) {
+        next(error);
+    }
+});
+
+// Агрегированный эндпоинт
+app.get('/users/:userId/details', validateId, async (req, res, next) => {
+    try {
+        const userId = req.params.userId;
+
+        const [user, userOrders] = await Promise.all([
+            userService.getUser(userId),
+            orderService.getOrdersByUserId(userId)
+        ]);
+
+        if (user.error === 'User not found') {
+            return res.status(404).json(user);
+        }
+
+        res.json({
+            user,
+            orders: userOrders,
+            summary: {
+                totalOrders: userOrders.length,
+                totalSpent: userOrders.reduce((sum, order) => sum + (order.price || 0), 0)
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+});
+
 // Глобальная обработка ошибок
 app.use(errorHandler);
 // Обработка страницы 404
