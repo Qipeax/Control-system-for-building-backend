@@ -6,7 +6,7 @@ const CircuitBreaker = require('opossum');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ========== ШАГ 1: Выносим конфигурацию ==========
+// ========== ШАГ 1 + ШАГ 2 ==========
 const CONFIG = {
     SERVICES: {
         USERS: {
@@ -29,7 +29,102 @@ const CONFIG = {
 app.use(cors());
 app.use(express.json());
 
-// ========== ШАГ 1: Создаем фабрику Circuit Breaker ==========
+// ========== ШАГ 2: Создаем базовый Service класс ==========
+class BaseService {
+    constructor(serviceName, baseUrl, circuitBreaker) {
+        this.serviceName = serviceName;
+        this.baseUrl = baseUrl;
+        this.circuit = circuitBreaker;
+    }
+
+    async request(path, method = 'GET', data = null) {
+        const url = `${this.baseUrl}${path}`;
+        const options = { method };
+        
+        if (data && (method === 'POST' || method === 'PUT')) {
+            options.data = data;
+        }
+        
+        return this.circuit.fire(url, options);
+    }
+
+    getFallbackMessage() {
+        return `${this.serviceName} service temporarily unavailable`;
+    }
+}
+
+// ========== ШАГ 2: Создаем UserService ==========
+class UserService extends BaseService {
+    constructor(circuitBreaker) {
+        super('users', CONFIG.SERVICES.USERS.URL, circuitBreaker);
+    }
+
+    async getUser(userId) {
+        return this.request(`/users/${userId}`);
+    }
+
+    async createUser(userData) {
+        return this.request('/users', 'POST', userData);
+    }
+
+    async getAllUsers() {
+        return this.request('/users');
+    }
+
+    async updateUser(userId, userData) {
+        return this.request(`/users/${userId}`, 'PUT', userData);
+    }
+
+    async deleteUser(userId) {
+        return this.request(`/users/${userId}`, 'DELETE');
+    }
+}
+
+// ========== ШАГ 2: Создаем OrderService ==========
+class OrderService extends BaseService {
+    constructor(circuitBreaker) {
+        super('orders', CONFIG.SERVICES.ORDERS.URL, circuitBreaker);
+    }
+
+    async getOrder(orderId) {
+        return this.request(`/orders/${orderId}`);
+    }
+
+    async createOrder(orderData) {
+        return this.request('/orders', 'POST', orderData);
+    }
+
+    async getAllOrders() {
+        return this.request('/orders');
+    }
+
+    async updateOrder(orderId, orderData) {
+        return this.request(`/orders/${orderId}`, 'PUT', orderData);
+    }
+
+    async deleteOrder(orderId) {
+        return this.request(`/orders/${orderId}`, 'DELETE');
+    }
+
+    async getStatus() {
+        return this.request('/orders/status');
+    }
+
+    async getHealth() {
+        return this.request('/orders/health');
+    }
+
+    async getOrdersByUserId(userId) {
+        const allOrders = await this.getAllOrders();
+        // Проверяем, что allOrders - массив
+        if (Array.isArray(allOrders)) {
+            return allOrders.filter(order => order.userId == userId);
+        }
+        return [];
+    }
+}
+
+// ========== ШАГ 2: Фабрика Circuit Breaker ==========
 function createCircuitBreaker() {
     const options = {
         timeout: CONFIG.CIRCUIT_BREAKER.TIMEOUT,
@@ -37,7 +132,7 @@ function createCircuitBreaker() {
         resetTimeout: CONFIG.CIRCUIT_BREAKER.RESET_TIMEOUT,
     };
 
-    return new CircuitBreaker(async (url, options = {}) => {
+    const circuit = new CircuitBreaker(async (url, options = {}) => {
         try {
             const response = await axios({
                 url, ...options,
@@ -51,37 +146,28 @@ function createCircuitBreaker() {
             throw error;
         }
     }, options);
+
+    // Добавляем fallback позже, когда будем знать имя сервиса
+    return circuit;
 }
 
-// Create circuit breakers for each service
+// ========== ШАГ 2: Инициализация сервисов ==========
 const usersCircuit = createCircuitBreaker();
 const ordersCircuit = createCircuitBreaker();
 
-// Fallback functions
-usersCircuit.fallback(() => ({ error: 'Users service temporarily unavailable' }));
-ordersCircuit.fallback(() => ({ error: 'Orders service temporarily unavailable' }));
+// Создаем экземпляры сервисов
+const userService = new UserService(usersCircuit);
+const orderService = new OrderService(ordersCircuit);
 
-// ========== ШАГ 1: Вспомогательные функции ==========
-function makeRequest(circuit, serviceUrl, path, method = 'GET', data = null) {
-    const url = `${serviceUrl}${path}`;
-    const options = { method };
-    
-    if (data && (method === 'POST' || method === 'PUT')) {
-        options.data = data;
-    }
-    
-    return circuit.fire(url, options);
-}
+// Настраиваем fallback с использованием сервисов
+usersCircuit.fallback(() => ({ error: userService.getFallbackMessage() }));
+ordersCircuit.fallback(() => ({ error: orderService.getFallbackMessage() }));
 
-// Routes with Circuit Breaker
+// ========== ШАГ 2: Обновляем маршруты ==========
+// User routes (используем UserService)
 app.get('/users/:userId', async (req, res) => {
     try {
-        const user = await makeRequest(
-            usersCircuit, 
-            CONFIG.SERVICES.USERS.URL, 
-            `/users/${req.params.userId}`
-        );
-        
+        const user = await userService.getUser(req.params.userId);
         if (user.error === 'User not found') {
             res.status(404).json(user);
         } else {
@@ -94,13 +180,7 @@ app.get('/users/:userId', async (req, res) => {
 
 app.post('/users', async (req, res) => {
     try {
-        const user = await makeRequest(
-            usersCircuit,
-            CONFIG.SERVICES.USERS.URL,
-            '/users',
-            'POST',
-            req.body
-        );
+        const user = await userService.createUser(req.body);
         res.status(201).json(user);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -109,11 +189,7 @@ app.post('/users', async (req, res) => {
 
 app.get('/users', async (req, res) => {
     try {
-        const users = await makeRequest(
-            usersCircuit,
-            CONFIG.SERVICES.USERS.URL,
-            '/users'
-        );
+        const users = await userService.getAllUsers();
         res.json(users);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -122,12 +198,7 @@ app.get('/users', async (req, res) => {
 
 app.delete('/users/:userId', async (req, res) => {
     try {
-        const result = await makeRequest(
-            usersCircuit,
-            CONFIG.SERVICES.USERS.URL,
-            `/users/${req.params.userId}`,
-            'DELETE'
-        );
+        const result = await userService.deleteUser(req.params.userId);
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -136,24 +207,17 @@ app.delete('/users/:userId', async (req, res) => {
 
 app.put('/users/:userId', async (req, res) => {
     try {
-        const user = await makeRequest(
-            usersCircuit,
-            CONFIG.SERVICES.USERS.URL,
-            `/users/${req.params.userId}`,
-            'PUT',
-            req.body
-        );
+        const user = await userService.updateUser(req.params.userId, req.body);
         res.json(user);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// ========== Остальные маршруты остаются пока без изменений ==========
-// Orders routes (пока оставляем как есть для безопасности)
+// Order routes (используем OrderService)
 app.get('/orders/:orderId', async (req, res) => {
     try {
-        const order = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders/${req.params.orderId}`);
+        const order = await orderService.getOrder(req.params.orderId);
         if (order.error === 'Order not found') {
             res.status(404).json(order);
         } else {
@@ -166,10 +230,7 @@ app.get('/orders/:orderId', async (req, res) => {
 
 app.post('/orders', async (req, res) => {
     try {
-        const order = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders`, {
-            method: 'POST',
-            data: req.body
-        });
+        const order = await orderService.createOrder(req.body);
         res.status(201).json(order);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -178,7 +239,7 @@ app.post('/orders', async (req, res) => {
 
 app.get('/orders', async (req, res) => {
     try {
-        const orders = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders`);
+        const orders = await orderService.getAllOrders();
         res.json(orders);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -187,9 +248,7 @@ app.get('/orders', async (req, res) => {
 
 app.delete('/orders/:orderId', async (req, res) => {
     try {
-        const result = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders/${req.params.orderId}`, {
-            method: 'DELETE'
-        });
+        const result = await orderService.deleteOrder(req.params.orderId);
         res.json(result);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -198,10 +257,7 @@ app.delete('/orders/:orderId', async (req, res) => {
 
 app.put('/orders/:orderId', async (req, res) => {
     try {
-        const order = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders/${req.params.orderId}`, {
-            method: 'PUT',
-            data: req.body
-        });
+        const order = await orderService.updateOrder(req.params.orderId, req.body);
         res.json(order);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -210,7 +266,7 @@ app.put('/orders/:orderId', async (req, res) => {
 
 app.get('/orders/status', async (req, res) => {
     try {
-        const status = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders/status`);
+        const status = await orderService.getStatus();
         res.json(status);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
@@ -219,34 +275,27 @@ app.get('/orders/status', async (req, res) => {
 
 app.get('/orders/health', async (req, res) => {
     try {
-        const health = await ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders/health`);
+        const health = await orderService.getHealth();
         res.json(health);
     } catch (error) {
         res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Gateway Aggregation: Get user details with their orders
+// Gateway Aggregation (используем оба сервиса)
 app.get('/users/:userId/details', async (req, res) => {
     try {
         const userId = req.params.userId;
 
-        // Get user details
-        const userPromise = usersCircuit.fire(`${CONFIG.SERVICES.USERS.URL}/users/${userId}`);
+        const [user, userOrders] = await Promise.all([
+            userService.getUser(userId),
+            orderService.getOrdersByUserId(userId)
+        ]);
 
-        // Get user's orders (assuming orders have a userId field)
-        const ordersPromise = ordersCircuit.fire(`${CONFIG.SERVICES.ORDERS.URL}/orders`)
-            .then(orders => orders.filter(order => order.userId == userId));
-
-        // Wait for both requests to complete
-        const [user, userOrders] = await Promise.all([userPromise, ordersPromise]);
-
-        // If user not found, return 404
         if (user.error === 'User not found') {
             return res.status(404).json(user);
         }
 
-        // Return aggregated response
         res.json({
             user,
             orders: userOrders
@@ -256,7 +305,7 @@ app.get('/users/:userId/details', async (req, res) => {
     }
 });
 
-// Health check endpoint that shows circuit breaker status
+// Health check endpoint
 app.get('/health', (req, res) => {
     res.json({
         status: 'API Gateway is running',
