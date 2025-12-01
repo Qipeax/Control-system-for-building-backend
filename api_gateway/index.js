@@ -6,43 +6,88 @@ const CircuitBreaker = require('opossum');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ========== ВСЕ ПРЕДЫДУЩИЕ ШАГИ + НОВОЕ ==========
+// ========== ФИНАЛЬНАЯ КОНФИГУРАЦИЯ ==========
 const CONFIG = {
     SERVICES: {
         USERS: {
             URL: process.env.USERS_SERVICE_URL || 'http://service_users:8000',
-            TIMEOUT: 3000
+            TIMEOUT: parseInt(process.env.USERS_SERVICE_TIMEOUT) || 3000
         },
         ORDERS: {
             URL: process.env.ORDERS_SERVICE_URL || 'http://service_orders:8000',
-            TIMEOUT: 3000
+            TIMEOUT: parseInt(process.env.ORDERS_SERVICE_TIMEOUT) || 3000
         }
     },
     CIRCUIT_BREAKER: {
-        TIMEOUT: 3000,
-        ERROR_THRESHOLD_PERCENTAGE: 50,
-        RESET_TIMEOUT: 3000
-    }
+        TIMEOUT: parseInt(process.env.CIRCUIT_TIMEOUT) || 3000,
+        ERROR_THRESHOLD_PERCENTAGE: parseInt(process.env.CIRCUIT_ERROR_THRESHOLD) || 50,
+        RESET_TIMEOUT: parseInt(process.env.CIRCUIT_RESET_TIMEOUT) || 30000 // Исправлено: 30 секунд
+    },
+    REQUEST_TIMEOUT: parseInt(process.env.REQUEST_TIMEOUT) || 10000
 };
 
-// ========== ШАГ 3: Простое логирование ==========
+// ========== ЛОГИРОВАНИЕ ==========
 const logger = {
-    info: (message) => console.log(`[INFO] ${new Date().toISOString()} - ${message}`),
-    error: (message, error) => console.error(`[ERROR] ${new Date().toISOString()} - ${message}`, error),
-    warn: (message) => console.warn(`[WARN] ${new Date().toISOString()} - ${message}`)
+    info: (message, meta = {}) => console.log(JSON.stringify({
+        level: 'INFO',
+        timestamp: new Date().toISOString(),
+        message,
+        ...meta
+    })),
+    
+    error: (message, error = null, meta = {}) => console.error(JSON.stringify({
+        level: 'ERROR',
+        timestamp: new Date().toISOString(),
+        message,
+        error: error ? error.message : null,
+        stack: error ? error.stack : null,
+        ...meta
+    })),
+    
+    warn: (message, meta = {}) => console.warn(JSON.stringify({
+        level: 'WARN',
+        timestamp: new Date().toISOString(),
+        message,
+        ...meta
+    }))
 };
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// ========== ШАГ 3: Middleware для логирования запросов ==========
+// ========== MIDDLEWARE ДЛЯ ЛОГИРОВАНИЯ ЗАПРОСОВ ==========
 app.use((req, res, next) => {
-    logger.info(`${req.method} ${req.url}`);
+    const startTime = Date.now();
+    
+    // Логируем начало запроса
+    logger.info('Request started', {
+        method: req.method,
+        url: req.url,
+        ip: req.ip,
+        userAgent: req.get('user-agent')
+    });
+    
+    // Перехватываем отправку ответа для логирования
+    const originalSend = res.send;
+    res.send = function(data) {
+        const duration = Date.now() - startTime;
+        
+        logger.info('Request completed', {
+            method: req.method,
+            url: req.url,
+            statusCode: res.statusCode,
+            duration: `${duration}ms`,
+            contentLength: res.get('Content-Length')
+        });
+        
+        return originalSend.call(this, data);
+    };
+    
     next();
 });
 
-// Классы из Шага 2 (оставляем без изменений)
+// ========== КЛАССЫ СЕРВИСОВ ==========
 class BaseService {
     constructor(serviceName, baseUrl, circuitBreaker) {
         this.serviceName = serviceName;
@@ -52,11 +97,20 @@ class BaseService {
 
     async request(path, method = 'GET', data = null) {
         const url = `${this.baseUrl}${path}`;
-        const options = { method };
+        const options = { 
+            method,
+            timeout: CONFIG.REQUEST_TIMEOUT
+        };
         
         if (data && (method === 'POST' || method === 'PUT')) {
             options.data = data;
         }
+        
+        logger.info('Service request', {
+            service: this.serviceName,
+            url,
+            method
+        });
         
         return this.circuit.fire(url, options);
     }
@@ -126,27 +180,35 @@ class OrderService extends BaseService {
     }
 
     async getOrdersByUserId(userId) {
-        const allOrders = await this.getAllOrders();
-        if (Array.isArray(allOrders)) {
-            return allOrders.filter(order => order.userId == userId);
+        try {
+            const allOrders = await this.getAllOrders();
+            if (Array.isArray(allOrders)) {
+                return allOrders.filter(order => order.userId == userId);
+            }
+            return [];
+        } catch (error) {
+            logger.error('Failed to get orders by user ID', error, { userId });
+            return [];
         }
-        return [];
     }
 }
 
-// ========== ШАГ 3: Улучшенная фабрика Circuit Breaker ==========
+// ========== ФАБРИКА CIRCUIT BREAKER ==========
 function createCircuitBreaker(serviceName) {
     const options = {
         timeout: CONFIG.CIRCUIT_BREAKER.TIMEOUT,
         errorThresholdPercentage: CONFIG.CIRCUIT_BREAKER.ERROR_THRESHOLD_PERCENTAGE,
         resetTimeout: CONFIG.CIRCUIT_BREAKER.RESET_TIMEOUT,
+        name: serviceName
     };
 
-    const circuit = new CircuitBreaker(async (url, options = {}) => {
+    const circuit = new CircuitBreaker(async (url, requestOptions = {}) => {
         try {
             const response = await axios({
-                url, ...options,
-                validateStatus: status => (status >= 200 && status < 300) || status === 404
+                url,
+                ...requestOptions,
+                validateStatus: status => (status >= 200 && status < 300) || status === 404,
+                timeout: CONFIG.REQUEST_TIMEOUT
             });
             return response.data;
         } catch (error) {
@@ -157,37 +219,45 @@ function createCircuitBreaker(serviceName) {
         }
     }, options);
 
-    // Логирование событий Circuit Breaker
-    circuit.on('open', () => logger.warn(`Circuit breaker for ${serviceName} opened`));
-    circuit.on('close', () => logger.info(`Circuit breaker for ${serviceName} closed`));
-    circuit.on('halfOpen', () => logger.info(`Circuit breaker for ${serviceName} half-open`));
-    circuit.on('failure', (error) => logger.error(`Circuit breaker for ${serviceName} failure`, error));
+    // События Circuit Breaker
+    circuit.on('open', () => logger.warn(`Circuit breaker opened`, { service: serviceName }));
+    circuit.on('close', () => logger.info(`Circuit breaker closed`, { service: serviceName }));
+    circuit.on('halfOpen', () => logger.info(`Circuit breaker half-open`, { service: serviceName }));
+    circuit.on('failure', (error) => logger.error(`Circuit breaker failure`, error, { service: serviceName }));
+    circuit.on('success', () => logger.info(`Circuit breaker request succeeded`, { service: serviceName }));
 
     return circuit;
 }
 
-// Инициализация сервисов
+// ========== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ==========
 const usersCircuit = createCircuitBreaker('users');
 const ordersCircuit = createCircuitBreaker('orders');
 
 const userService = new UserService(usersCircuit);
 const orderService = new OrderService(ordersCircuit);
 
-usersCircuit.fallback(() => ({ error: userService.getFallbackMessage() }));
-ordersCircuit.fallback(() => ({ error: orderService.getFallbackMessage() }));
+usersCircuit.fallback(() => ({ 
+    error: userService.getFallbackMessage(),
+    timestamp: new Date().toISOString()
+}));
 
-// ========== ШАГ 3: Middleware для валидации ID ==========
+ordersCircuit.fallback(() => ({ 
+    error: orderService.getFallbackMessage(),
+    timestamp: new Date().toISOString()
+}));
+
+// ========== MIDDLEWARE ==========
 function validateId(req, res, next) {
     const userId = req.params.userId;
     const orderId = req.params.orderId;
     const id = userId || orderId;
     
     if (!id) {
-        return next(); // Если нет ID, пропускаем
+        return next();
     }
     
-    // Простая валидация: только буквы, цифры, дефисы и подчеркивания
     if (!/^[a-zA-Z0-9-_]+$/.test(id)) {
+        logger.warn('Invalid ID format', { id });
         return res.status(400).json({ 
             error: 'Invalid ID format',
             message: 'ID can only contain letters, numbers, hyphens, and underscores'
@@ -197,39 +267,43 @@ function validateId(req, res, next) {
     next();
 }
 
-// ========== ШАГ 3: Обертка для обработки ошибок ==========
 function asyncHandler(fn) {
     return async (req, res, next) => {
         try {
             await fn(req, res, next);
         } catch (error) {
-            logger.error('Unhandled error in route handler', error);
+            logger.error('Unhandled error in route handler', error, {
+                url: req.url,
+                method: req.method
+            });
             next(error);
         }
     };
 }
 
-// ========== ШАГ 3: Глобальный обработчик ошибок ==========
+// ========== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ==========
 app.use((error, req, res, next) => {
-    logger.error('Global error handler caught:', error);
+    logger.error('Global error handler caught error', error, {
+        url: req.url,
+        method: req.method
+    });
     
-    // Если это ошибка Circuit Breaker
     if (error.message && error.message.includes('circuit')) {
         return res.status(503).json({
             error: 'Service temporarily unavailable',
-            timestamp: new Date().toISOString()
+            timestamp: new Date().toISOString(),
+            requestId: req.id || Math.random().toString(36).substr(2, 9)
         });
     }
     
-    // Для всех остальных ошибок
     res.status(500).json({
         error: 'Internal server error',
-        timestamp: new Date().toISOString()
+        timestamp: new Date().toISOString(),
+        requestId: req.id || Math.random().toString(36).substr(2, 9)
     });
 });
 
-// ========== ОБНОВЛЕННЫЕ МАРШРУТЫ С VALIDATE_ID И ASYNC_HANDLER ==========
-
+// ========== МАРШРУТЫ ==========
 // User routes
 app.get('/users/:userId', validateId, asyncHandler(async (req, res) => {
     const user = await userService.getUser(req.params.userId);
@@ -329,27 +403,50 @@ app.get('/health', (req, res) => {
         status: 'API Gateway is running',
         timestamp: new Date().toISOString(),
         environment: process.env.NODE_ENV || 'development',
+        config: {
+            usersServiceUrl: CONFIG.SERVICES.USERS.URL,
+            ordersServiceUrl: CONFIG.SERVICES.ORDERS.URL
+        },
         circuits: {
-            users: usersCircuit.status,
-            orders: ordersCircuit.status
+            users: {
+                status: usersCircuit.status,
+                stats: usersCircuit.stats
+            },
+            orders: {
+                status: ordersCircuit.status,
+                stats: ordersCircuit.stats
+            }
         }
     });
 });
 
 app.get('/status', (req, res) => {
-    res.json({ status: 'API Gateway is running' });
-});
-
-// ========== ШАГ 3: Обработка 404 ==========
-app.use('*', (req, res) => {
-    logger.warn(`Route not found: ${req.originalUrl}`);
-    res.status(404).json({
-        error: 'Route not found',
-        path: req.originalUrl
+    res.json({ 
+        status: 'API Gateway is running',
+        timestamp: new Date().toISOString()
     });
 });
 
-// Start server
-app.listen(PORT, () => {
-    logger.info(`API Gateway running on port ${PORT}`);
+// ========== ОБРАБОТКА 404 ==========
+app.use('*', (req, res) => {
+    logger.warn('Route not found', { url: req.originalUrl });
+    res.status(404).json({
+        error: 'Route not found',
+        path: req.originalUrl,
+        timestamp: new Date().toISOString()
+    });
 });
+
+// ========== ЗАПУСК СЕРВЕРА ==========
+app.listen(PORT, () => {
+    logger.info(`API Gateway started successfully`, {
+        port: PORT,
+        environment: process.env.NODE_ENV || 'development',
+        services: {
+            users: CONFIG.SERVICES.USERS.URL,
+            orders: CONFIG.SERVICES.ORDERS.URL
+        }
+    });
+});
+
+module.exports = app;
