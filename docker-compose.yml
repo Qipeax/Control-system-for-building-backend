@@ -1,0 +1,23 @@
+
+
+services:
+  # API Gateway
+
+
+  # Users Service
+  user_service:
+    build: ./user_service
+    ports:
+      - "8001:8000"  # только для отладки, в продакшене можно убрать
+    environment:
+      - NODE_ENV=production
+      - PORT=8000
+    networks:
+      - microservices-network
+
+  # Orders Service  
+  
+
+networks:
+  microservices-network:
+    driver: bridge

@@ -2,40 +2,30 @@ const express = require("express");
 const cors = require("cors");
 const axios = require("axios");
 const CircuitBreaker = require("opossum");
-const rateLimit = require("express-rate-limit");
-const helmet = require("helmet");
-const Joi = require("joi");
 
 const app = express();
 const PORT = process.env.PORT || 8000;
+
 // Конфигурация
 const config = {
   services: {
     users: {
       url: process.env.USERS_SERVICE_URL || "http://service_users:8000",
-      timeout: parseInt(process.env.USERS_SERVICE_TIMEOUT) || 3000,
     },
     orders: {
       url: process.env.ORDERS_SERVICE_URL || "http://service_orders:8000",
-      timeout: parseInt(process.env.ORDERS_SERVICE_TIMEOUT) || 3000,
     },
   },
   circuitBreaker: {
-    timeout: parseInt(process.env.CIRCUIT_TIMEOUT) || 3000,
-    errorThresholdPercentage:
-      parseInt(process.env.CIRCUIT_ERROR_THRESHOLD) || 50,
-    resetTimeout: parseInt(process.env.CIRCUIT_RESET_TIMEOUT) || 30000,
-  },
-  rateLimit: {
-    windowMs: 15 * 60 * 1000,
-    max: 100,
+    timeout: 5000,
+    errorThresholdPercentage: 50,
+    resetTimeout: 30000,
   },
 };
+
 // Middleware
-app.use(helmet());
 app.use(cors());
 app.use(express.json());
-app.use(rateLimit(config.rateLimit));
 
 // Логирование
 const logger = {
@@ -71,9 +61,10 @@ class CircuitBreakerFactory {
         const response = await axios({
           url,
           ...options,
-          validateStatus: (status) =>
-            (status >= 200 && status < 300) || status === 404,
-          timeout: config.circuitBreaker.timeout,
+          validateStatus: function (status) {
+            return (status >= 200 && status < 300) || status === 404;
+          },
+          timeout: this.defaultOptions.timeout,
         });
         return response.data;
       } catch (error) {
@@ -83,6 +74,28 @@ class CircuitBreakerFactory {
         throw error;
       }
     };
+  }
+
+  createFallbackResponse(serviceName) {
+    return {
+      error: `${serviceName} service temporarily unavailable`,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  setupEventListeners(circuit, serviceName) {
+    circuit.on("open", () =>
+      logger.warn(`Circuit breaker for ${serviceName} opened`)
+    );
+    circuit.on("close", () =>
+      logger.info(`Circuit breaker for ${serviceName} closed`)
+    );
+    circuit.on("halfOpen", () =>
+      logger.info(`Circuit breaker for ${serviceName} half-open`)
+    );
+    circuit.on("failure", (error) =>
+      logger.error(`Circuit breaker for ${serviceName} failure:`, error.message)
+    );
   }
 }
 
@@ -177,8 +190,19 @@ class OrderService extends BaseService {
   }
 
   async getOrdersByUserId(userId) {
-    const allOrders = await this.getOrders();
-    return allOrders.filter((order) => order.userId == userId);
+    try {
+      const allOrders = await this.getOrders();
+      // Если сервис заказов недоступен, возвращаем пустой массив
+      if (allOrders && allOrders.error) {
+        return [];
+      }
+      return Array.isArray(allOrders)
+        ? allOrders.filter((order) => order.userId == userId)
+        : [];
+    } catch (error) {
+      logger.error("Error filtering orders by user ID:", error);
+      return [];
+    }
   }
 
   async updateOrder(orderId, orderData) {
@@ -203,31 +227,7 @@ class OrderService extends BaseService {
   }
 }
 
-// Валидация
-const userSchema = Joi.object({
-  name: Joi.string().min(1).max(100).required(),
-  email: Joi.string().email().required(),
-  age: Joi.number().integer().min(0).max(150).optional(),
-});
-
-const orderSchema = Joi.object({
-  userId: Joi.string().required(),
-  product: Joi.string().min(1).max(255).required(),
-  quantity: Joi.number().integer().min(1).required(),
-  price: Joi.number().min(0).precision(2).required(),
-});
-
-const validate = (schema) => (req, res, next) => {
-  const { error } = schema.validate(req.body);
-  if (error) {
-    return res.status(400).json({
-      error: "Validation failed",
-      details: error.details.map((detail) => detail.message),
-    });
-  }
-  next();
-};
-
+// Простая валидация (упрощенная версия без Joi)
 const validateId = (req, res, next) => {
   const id = req.params.userId || req.params.orderId;
   if (!id || !/^[a-zA-Z0-9-_]+$/.test(id)) {
@@ -237,11 +237,56 @@ const validateId = (req, res, next) => {
   }
   next();
 };
+
+const validateUser = (req, res, next) => {
+  const { name, email } = req.body;
+  if (!name || !email) {
+    return res.status(400).json({
+      error: "Name and email are required",
+    });
+  }
+  if (typeof name !== "string" || name.trim().length === 0) {
+    return res.status(400).json({
+      error: "Name must be a non-empty string",
+    });
+  }
+  if (typeof email !== "string" || !email.includes("@")) {
+    return res.status(400).json({
+      error: "Valid email is required",
+    });
+  }
+  next();
+};
+
+const validateOrder = (req, res, next) => {
+  const { userId, product, quantity, price } = req.body;
+  if (!userId || !product || !quantity || !price) {
+    return res.status(400).json({
+      error: "userId, product, quantity, and price are required",
+    });
+  }
+  if (typeof product !== "string" || product.trim().length === 0) {
+    return res.status(400).json({
+      error: "Product must be a non-empty string",
+    });
+  }
+  if (typeof quantity !== "number" || quantity < 1) {
+    return res.status(400).json({
+      error: "Quantity must be a number greater than 0",
+    });
+  }
+  if (typeof price !== "number" || price < 0) {
+    return res.status(400).json({
+      error: "Price must be a non-negative number",
+    });
+  }
+  next();
+};
+
 // Обработка ошибок
 const errorHandler = (error, req, res, next) => {
   logger.error("Unhandled error:", {
     error: error.message,
-    stack: error.stack,
     url: req.url,
     method: req.method,
   });
@@ -250,13 +295,6 @@ const errorHandler = (error, req, res, next) => {
     return res.status(error.status).json({
       error: error.message,
       ...(error.details && { details: error.details }),
-    });
-  }
-
-  if (error.message && error.message.includes("circuit")) {
-    return res.status(503).json({
-      error: "Service temporarily unavailable",
-      timestamp: new Date().toISOString(),
     });
   }
 
@@ -270,182 +308,191 @@ const errorHandler = (error, req, res, next) => {
 const circuitFactory = new CircuitBreakerFactory(config.circuitBreaker);
 
 const userService = new UserService(
-    circuitFactory.create('users'),
-    config.services.users.url
+  circuitFactory.create("users"),
+  config.services.users.url
 );
 
 const orderService = new OrderService(
-    circuitFactory.create('orders'),
-    config.services.orders.url
+  circuitFactory.create("orders"),
+  config.services.orders.url
 );
 
 // Маршруты для пользователей
-app.get('/users/:userId', validateId, async (req, res, next) => {
-    try {
-        const user = await userService.getUser(req.params.userId);
-        if (user.error === 'User not found') {
-            res.status(404).json(user);
-        } else {
-            res.json(user);
-        }
-    } catch (error) {
-        next(error);
+app.get("/users/:userId", validateId, async (req, res, next) => {
+  try {
+    const user = await userService.getUser(req.params.userId);
+    if (user && user.error === "User not found") {
+      res.status(404).json(user);
+    } else {
+      res.json(user);
     }
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post('/users', validate(userSchema), async (req, res, next) => {
-    try {
-        const user = await userService.createUser(req.body);
-        res.status(201).json(user);
-    } catch (error) {
-        next(error);
-    }
+app.post("/users", validateUser, async (req, res, next) => {
+  try {
+    const user = await userService.createUser(req.body);
+    res.status(201).json(user);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/users', async (req, res, next) => {
-    try {
-        const users = await userService.getUsers();
-        res.json(users);
-    } catch (error) {
-        next(error);
-    }
+app.get("/users", async (req, res, next) => {
+  try {
+    const users = await userService.getUsers();
+    res.json(users);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.put('/users/:userId', validateId, validate(userSchema), async (req, res, next) => {
-    try {
-        const user = await userService.updateUser(req.params.userId, req.body);
-        res.json(user);
-    } catch (error) {
-        next(error);
-    }
+app.put("/users/:userId", validateId, validateUser, async (req, res, next) => {
+  try {
+    const user = await userService.updateUser(req.params.userId, req.body);
+    res.json(user);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.delete('/users/:userId', validateId, async (req, res, next) => {
-    try {
-        const result = await userService.deleteUser(req.params.userId);
-        res.json(result);
-    } catch (error) {
-        next(error);
-    }
+app.delete("/users/:userId", validateId, async (req, res, next) => {
+  try {
+    const result = await userService.deleteUser(req.params.userId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Маршруты для заказов
-app.get('/orders/:orderId', validateId, async (req, res, next) => {
-    try {
-        const order = await orderService.getOrder(req.params.orderId);
-        if (order.error === 'Order not found') {
-            res.status(404).json(order);
-        } else {
-            res.json(order);
-        }
-    } catch (error) {
-        next(error);
+app.get("/orders/:orderId", validateId, async (req, res, next) => {
+  try {
+    const order = await orderService.getOrder(req.params.orderId);
+    if (order && order.error === "Order not found") {
+      res.status(404).json(order);
+    } else {
+      res.json(order);
     }
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post('/orders', validate(orderSchema), async (req, res, next) => {
-    try {
-        const order = await orderService.createOrder(req.body);
-        res.status(201).json(order);
-    } catch (error) {
-        next(error);
-    }
+app.post("/orders", validateOrder, async (req, res, next) => {
+  try {
+    const order = await orderService.createOrder(req.body);
+    res.status(201).json(order);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/orders', async (req, res, next) => {
-    try {
-        const orders = await orderService.getOrders();
-        res.json(orders);
-    } catch (error) {
-        next(error);
-    }
+app.get("/orders", async (req, res, next) => {
+  try {
+    const orders = await orderService.getOrders();
+    res.json(orders);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.delete('/orders/:orderId', validateId, async (req, res, next) => {
-    try {
-        const result = await orderService.deleteOrder(req.params.orderId);
-        res.json(result);
-    } catch (error) {
-        next(error);
-    }
+app.delete("/orders/:orderId", validateId, async (req, res, next) => {
+  try {
+    const result = await orderService.deleteOrder(req.params.orderId);
+    res.json(result);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.put('/orders/:orderId', validateId, validate(orderSchema), async (req, res, next) => {
+app.put(
+  "/orders/:orderId",
+  validateId,
+  validateOrder,
+  async (req, res, next) => {
     try {
-        const order = await orderService.updateOrder(req.params.orderId, req.body);
-        res.json(order);
+      const order = await orderService.updateOrder(
+        req.params.orderId,
+        req.body
+      );
+      res.json(order);
     } catch (error) {
-        next(error);
+      next(error);
     }
+  }
+);
+
+app.get("/orders/status", async (req, res, next) => {
+  try {
+    const status = await orderService.getStatus();
+    res.json(status);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.get('/orders/status', async (req, res, next) => {
-    try {
-        const status = await orderService.getStatus();
-        res.json(status);
-    } catch (error) {
-        next(error);
-    }
-});
-
-app.get('/orders/health', async (req, res, next) => {
-    try {
-        const health = await orderService.getHealth();
-        res.json(health);
-    } catch (error) {
-        next(error);
-    }
+app.get("/orders/health", async (req, res, next) => {
+  try {
+    const health = await orderService.getHealth();
+    res.json(health);
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Агрегированный эндпоинт
-app.get('/users/:userId/details', validateId, async (req, res, next) => {
-    try {
-        const userId = req.params.userId;
+app.get("/users/:userId/details", validateId, async (req, res, next) => {
+  try {
+    const userId = req.params.userId;
 
-        const [user, userOrders] = await Promise.all([
-            userService.getUser(userId),
-            orderService.getOrdersByUserId(userId)
-        ]);
+    const [user, userOrders] = await Promise.all([
+      userService.getUser(userId),
+      orderService.getOrdersByUserId(userId),
+    ]);
 
-        if (user.error === 'User not found') {
-            return res.status(404).json(user);
-        }
-
-        res.json({
-            user,
-            orders: userOrders,
-            summary: {
-                totalOrders: userOrders.length,
-                totalSpent: userOrders.reduce((sum, order) => sum + (order.price || 0), 0)
-            }
-        });
-    } catch (error) {
-        next(error);
+    if (user && user.error === "User not found") {
+      return res.status(404).json(user);
     }
+
+    res.json({
+      user,
+      orders: userOrders || [],
+      summary: {
+        totalOrders: userOrders ? userOrders.length : 0,
+        totalSpent: userOrders
+          ? userOrders.reduce((sum, order) => sum + (order.price || 0), 0)
+          : 0,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Health check
-app.get('/health', (req, res) => {
-    res.json({
-        status: 'API Gateway is running',
-        timestamp: new Date().toISOString(),
-        environment: process.env.NODE_ENV || 'development',
-        circuits: {
-            users: userService.circuit.status,
-            orders: orderService.circuit.status
-        }
-    });
+app.get("/health", (req, res) => {
+  res.json({
+    status: "API Gateway is running",
+    timestamp: new Date().toISOString(),
+    environment: process.env.NODE_ENV || "development",
+    circuits: {
+      users: userService.circuit.status,
+      orders: orderService.circuit.status,
+    },
+  });
 });
 
-app.get('/status', (req, res) => {
-    res.json({ status: 'API Gateway is running' });
+app.get("/status", (req, res) => {
+  res.json({ status: "API Gateway is running" });
 });
-
 
 // Глобальная обработка ошибок
 app.use(errorHandler);
-// Обработка страницы 404
 
+// Обработка 404
 app.use("*", (req, res) => {
   res.status(404).json({
     error: "Route not found",
@@ -453,6 +500,9 @@ app.use("*", (req, res) => {
   });
 });
 
+// Запуск сервера
 app.listen(PORT, () => {
   logger.info(`API Gateway running on port ${PORT}`);
 });
+
+module.exports = app;
