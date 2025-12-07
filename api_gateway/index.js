@@ -6,7 +6,6 @@ const CircuitBreaker = require('opossum');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ========== ФИНАЛЬНАЯ КОНФИГУРАЦИЯ ==========
 const CONFIG = {
     SERVICES: {
         USERS: {
