@@ -4,7 +4,7 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 8000;
 
-// ========== ШАГ 2: Конфигурация ==========
+// ========== ШАГ 3: Конфигурация ==========
 const CONFIG = {
     PORT: process.env.PORT || 8000,
     DB: {
@@ -14,6 +14,41 @@ const CONFIG = {
         MAX_PRODUCT_LENGTH: 255,
         MIN_QUANTITY: 1,
         MIN_PRICE: 0
+    },
+    LOGGING: {
+        LEVEL: process.env.LOG_LEVEL || 'info'
+    }
+};
+
+// ========== ШАГ 3: Логирование ==========
+const logger = {
+    info: (message, meta = {}) => {
+        console.log(JSON.stringify({
+            level: 'INFO',
+            timestamp: new Date().toISOString(),
+            message,
+            ...meta
+        }));
+    },
+    
+    error: (message, error = null, meta = {}) => {
+        console.error(JSON.stringify({
+            level: 'ERROR',
+            timestamp: new Date().toISOString(),
+            message,
+            error: error ? error.message : null,
+            stack: error ? error.stack : null,
+            ...meta
+        }));
+    },
+    
+    warn: (message, meta = {}) => {
+        console.warn(JSON.stringify({
+            level: 'WARN',
+            timestamp: new Date().toISOString(),
+            message,
+            ...meta
+        }));
     }
 };
 
@@ -21,7 +56,41 @@ const CONFIG = {
 app.use(cors());
 app.use(express.json());
 
-// ========== ШАГ 2: Модуль базы данных ==========
+// ========== ШАГ 3: Middleware для логирования запросов ==========
+app.use((req, res, next) => {
+    const startTime = Date.now();
+    const requestId = Math.random().toString(36).substr(2, 9);
+    
+    // Сохраняем requestId для использования в логах
+    req.requestId = requestId;
+    
+    logger.info('Request started', {
+        requestId,
+        method: req.method,
+        url: req.url,
+        ip: req.ip
+    });
+    
+    // Перехватываем отправку ответа
+    const originalSend = res.send;
+    res.send = function(data) {
+        const duration = Date.now() - startTime;
+        
+        logger.info('Request completed', {
+            requestId,
+            method: req.method,
+            url: req.url,
+            statusCode: res.statusCode,
+            duration: `${duration}ms`
+        });
+        
+        return originalSend.call(this, data);
+    };
+    
+    next();
+});
+
+// ========== ШАГ 3: Модуль базы данных ==========
 class InMemoryDB {
     constructor() {
         this.data = {};
@@ -69,15 +138,63 @@ class InMemoryDB {
     }
 }
 
-// Инициализация базы данных
-const ordersDB = new InMemoryDB();
+// ========== ШАГ 3: Сервисный слой ==========
+class OrdersService {
+    constructor(db) {
+        this.db = db;
+    }
+    
+    getOrder(orderId) {
+        logger.info('Getting order', { orderId });
+        return this.db.getById(orderId);
+    }
+    
+    getAllOrders(userId = null) {
+        logger.info('Getting all orders', { userId: userId || 'none' });
+        
+        if (userId) {
+            return this.db.filterByUserId(userId);
+        }
+        
+        return this.db.getAll();
+    }
+    
+    createOrder(orderData) {
+        logger.info('Creating new order', { orderData });
+        return this.db.create(orderData);
+    }
+    
+    updateOrder(orderId, orderData) {
+        logger.info('Updating order', { orderId, orderData });
+        return this.db.update(orderId, orderData);
+    }
+    
+    deleteOrder(orderId) {
+        logger.info('Deleting order', { orderId });
+        return this.db.delete(orderId);
+    }
+    
+    getStats() {
+        const count = this.db.count();
+        const allOrders = this.db.getAll();
+        
+        const stats = {
+            totalOrders: count,
+            totalValue: allOrders.reduce((sum, order) => sum + (order.price || 0) * (order.quantity || 1), 0),
+            averageOrderValue: count > 0 ? 
+                allOrders.reduce((sum, order) => sum + (order.price || 0), 0) / count : 0
+        };
+        
+        logger.info('Getting service stats', stats);
+        return stats;
+    }
+}
 
-// ========== ШАГ 2: Валидация ==========
+// ========== ШАГ 3: Валидация (обновленная) ==========
 class OrderValidator {
     static validateOrderData(orderData, isUpdate = false) {
         const errors = [];
         
-        // Для создания обязательны все поля
         if (!isUpdate || orderData.product !== undefined) {
             if (!orderData.product || typeof orderData.product !== 'string') {
                 errors.push('Product must be a non-empty string');
@@ -134,22 +251,28 @@ class OrderValidator {
     }
 }
 
-// ========== ШАГ 2: Контроллер ==========
+// ========== ШАГ 3: Контроллер (обновленный) ==========
 class OrdersController {
-    constructor(db) {
-        this.db = db;
+    constructor(service) {
+        this.service = service;
     }
     
     getStatus(req, res) {
-        res.json({ status: 'Orders service is running' });
+        res.json({ 
+            status: 'Orders service is running',
+            timestamp: new Date().toISOString()
+        });
     }
     
     getHealth(req, res) {
+        const stats = this.service.getStats();
+        
         res.json({
             status: 'OK',
             service: 'Orders Service',
             timestamp: new Date().toISOString(),
-            dbCount: this.db.count()
+            dbCount: stats.totalOrders,
+            stats
         });
     }
     
@@ -157,12 +280,26 @@ class OrdersController {
         const validation = OrderValidator.validateOrderId(req.params.orderId);
         
         if (!validation.isValid) {
-            return res.status(400).json({ error: 'Invalid order ID', details: validation.errors });
+            logger.warn('Invalid order ID', { 
+                requestId: req.requestId,
+                orderId: req.params.orderId,
+                errors: validation.errors 
+            });
+            
+            return res.status(400).json({ 
+                error: 'Invalid order ID', 
+                details: validation.errors 
+            });
         }
         
-        const order = this.db.getById(validation.id);
+        const order = this.service.getOrder(validation.id);
         
         if (!order) {
+            logger.warn('Order not found', { 
+                requestId: req.requestId,
+                orderId: validation.id 
+            });
+            
             return res.status(404).json({ error: 'Order not found' });
         }
         
@@ -174,13 +311,22 @@ class OrdersController {
             const validation = OrderValidator.validateUserId(req.query.userId);
             
             if (!validation.isValid) {
-                return res.status(400).json({ error: 'Invalid user ID', details: validation.errors });
+                logger.warn('Invalid user ID', { 
+                    requestId: req.requestId,
+                    userId: req.query.userId,
+                    errors: validation.errors 
+                });
+                
+                return res.status(400).json({ 
+                    error: 'Invalid user ID', 
+                    details: validation.errors 
+                });
             }
             
-            const orders = this.db.filterByUserId(validation.id);
+            const orders = this.service.getAllOrders(validation.id);
             res.json(orders);
         } else {
-            const orders = this.db.getAll();
+            const orders = this.service.getAllOrders();
             res.json(orders);
         }
     }
@@ -189,37 +335,83 @@ class OrdersController {
         const validationErrors = OrderValidator.validateOrderData(req.body);
         
         if (validationErrors.length > 0) {
+            logger.warn('Order validation failed', { 
+                requestId: req.requestId,
+                errors: validationErrors,
+                data: req.body 
+            });
+            
             return res.status(400).json({ 
                 error: 'Validation failed', 
                 details: validationErrors 
             });
         }
         
-        const newOrder = this.db.create(req.body);
-        res.status(201).json(newOrder);
+        try {
+            const newOrder = this.service.createOrder(req.body);
+            
+            logger.info('Order created successfully', { 
+                requestId: req.requestId,
+                orderId: newOrder.id 
+            });
+            
+            res.status(201).json(newOrder);
+        } catch (error) {
+            logger.error('Failed to create order', error, { 
+                requestId: req.requestId,
+                data: req.body 
+            });
+            
+            res.status(500).json({ error: 'Failed to create order' });
+        }
     }
     
     updateOrder(req, res) {
         const idValidation = OrderValidator.validateOrderId(req.params.orderId);
         
         if (!idValidation.isValid) {
-            return res.status(400).json({ error: 'Invalid order ID', details: idValidation.errors });
+            logger.warn('Invalid order ID for update', { 
+                requestId: req.requestId,
+                orderId: req.params.orderId,
+                errors: idValidation.errors 
+            });
+            
+            return res.status(400).json({ 
+                error: 'Invalid order ID', 
+                details: idValidation.errors 
+            });
         }
         
         const dataValidationErrors = OrderValidator.validateOrderData(req.body, true);
         
         if (dataValidationErrors.length > 0) {
+            logger.warn('Order update validation failed', { 
+                requestId: req.requestId,
+                orderId: idValidation.id,
+                errors: dataValidationErrors 
+            });
+            
             return res.status(400).json({ 
                 error: 'Validation failed', 
                 details: dataValidationErrors 
             });
         }
         
-        const updatedOrder = this.db.update(idValidation.id, req.body);
+        const updatedOrder = this.service.updateOrder(idValidation.id, req.body);
         
         if (!updatedOrder) {
+            logger.warn('Order not found for update', { 
+                requestId: req.requestId,
+                orderId: idValidation.id 
+            });
+            
             return res.status(404).json({ error: 'Order not found' });
         }
+        
+        logger.info('Order updated successfully', { 
+            requestId: req.requestId,
+            orderId: idValidation.id 
+        });
         
         res.json(updatedOrder);
     }
@@ -228,36 +420,104 @@ class OrdersController {
         const validation = OrderValidator.validateOrderId(req.params.orderId);
         
         if (!validation.isValid) {
-            return res.status(400).json({ error: 'Invalid order ID', details: validation.errors });
+            logger.warn('Invalid order ID for deletion', { 
+                requestId: req.requestId,
+                orderId: req.params.orderId,
+                errors: validation.errors 
+            });
+            
+            return res.status(400).json({ 
+                error: 'Invalid order ID', 
+                details: validation.errors 
+            });
         }
         
-        const deletedOrder = this.db.delete(validation.id);
+        const deletedOrder = this.service.deleteOrder(validation.id);
         
         if (!deletedOrder) {
+            logger.warn('Order not found for deletion', { 
+                requestId: req.requestId,
+                orderId: validation.id 
+            });
+            
             return res.status(404).json({ error: 'Order not found' });
         }
         
+        logger.info('Order deleted successfully', { 
+            requestId: req.requestId,
+            orderId: validation.id 
+        });
+        
         res.json({ 
             message: 'Order deleted', 
-            deletedOrder,
-            remainingOrders: this.db.count()
+            deletedOrder
         });
     }
 }
 
-// ========== ШАГ 2: Инициализация контроллера ==========
-const ordersController = new OrdersController(ordersDB);
+// ========== ШАГ 3: Middleware для обработки ошибок ==========
+function asyncHandler(fn) {
+    return async (req, res, next) => {
+        try {
+            await fn(req, res, next);
+        } catch (error) {
+            logger.error('Unhandled error in route handler', error, {
+                requestId: req.requestId,
+                url: req.url,
+                method: req.method
+            });
+            next(error);
+        }
+    };
+}
 
-// ========== ШАГ 2: Маршруты с использованием контроллера ==========
-app.get('/orders/status', (req, res) => ordersController.getStatus(req, res));
-app.get('/orders/health', (req, res) => ordersController.getHealth(req, res));
-app.get('/orders/:orderId', (req, res) => ordersController.getOrder(req, res));
-app.get('/orders', (req, res) => ordersController.getAllOrders(req, res));
-app.post('/orders', (req, res) => ordersController.createOrder(req, res));
-app.put('/orders/:orderId', (req, res) => ordersController.updateOrder(req, res));
-app.delete('/orders/:orderId', (req, res) => ordersController.deleteOrder(req, res));
+app.use((error, req, res, next) => {
+    logger.error('Global error handler caught error', error, {
+        requestId: req.requestId,
+        url: req.url,
+        method: req.method
+    });
+    
+    res.status(500).json({
+        error: 'Internal server error',
+        timestamp: new Date().toISOString(),
+        requestId: req.requestId
+    });
+});
+
+// ========== ШАГ 3: Инициализация ==========
+const ordersDB = new InMemoryDB();
+const ordersService = new OrdersService(ordersDB);
+const ordersController = new OrdersController(ordersService);
+
+// ========== ШАГ 3: Маршруты с asyncHandler ==========
+app.get('/orders/status', asyncHandler((req, res) => ordersController.getStatus(req, res)));
+app.get('/orders/health', asyncHandler((req, res) => ordersController.getHealth(req, res)));
+app.get('/orders/:orderId', asyncHandler((req, res) => ordersController.getOrder(req, res)));
+app.get('/orders', asyncHandler((req, res) => ordersController.getAllOrders(req, res)));
+app.post('/orders', asyncHandler((req, res) => ordersController.createOrder(req, res)));
+app.put('/orders/:orderId', asyncHandler((req, res) => ordersController.updateOrder(req, res)));
+app.delete('/orders/:orderId', asyncHandler((req, res) => ordersController.deleteOrder(req, res)));
+
+// ========== ШАГ 3: Обработка 404 ==========
+app.use('*', (req, res) => {
+    logger.warn('Route not found', { 
+        requestId: req.requestId,
+        url: req.originalUrl 
+    });
+    
+    res.status(404).json({
+        error: 'Route not found',
+        path: req.originalUrl,
+        timestamp: new Date().toISOString(),
+        requestId: req.requestId
+    });
+});
 
 // Start server
 app.listen(CONFIG.PORT, () => {
-    console.log(`Orders service running on port ${CONFIG.PORT}`);
+    logger.info('Orders service started', {
+        port: CONFIG.PORT,
+        environment: process.env.NODE_ENV || 'development'
+    });
 });
