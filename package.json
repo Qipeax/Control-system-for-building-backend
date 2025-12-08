@@ -1,0 +1,22 @@
+{
+  "name": "e-commerce-microservices-tests",
+  "version": "1.0.0",
+  "description": "Тесты для микросервисной системы",
+  "main": "test-runner.js",
+  "scripts": {
+    "test": "node test-runner.js",
+    "test:watch": "nodemon test-runner.js",
+    "test:postman": "newman run docs/postman_collection.json",
+    "start": "docker-compose up --build",
+    "stop": "docker-compose down",
+    "logs": "docker-compose logs -f",
+    "health": "curl http://localhost:8000/api/v1/health"
+  },
+  "dependencies": {
+    "axios": "^1.6.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1",
+    "newman": "^6.1.1"
+  }
+}
