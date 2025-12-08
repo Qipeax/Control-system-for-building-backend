@@ -1,23 +1,46 @@
-
+version: '3.8'
 
 services:
-  # API Gateway
-
-
-  # Users Service
-  user_service:
-    build: ./user_service
+  api_gateway:
+    build: ./api_gateway
     ports:
-      - "8001:8000"  # только для отладки, в продакшене можно убрать
+      - "8000:8000"
     environment:
-      - NODE_ENV=production
-      - PORT=8000
+      - NODE_ENV=development
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - USERS_SERVICE_URL=http://service_users:8000
+      - ORDERS_SERVICE_URL=http://service_orders:8000
     networks:
-      - microservices-network
+      - app-network
+    depends_on:
+      - service_users
+      - service_orders
 
-  # Orders Service  
-  
+  service_users:
+    build: ./service_users
+    ports:
+      - "8001:8000"
+    environment:
+      - NODE_ENV=development
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - ADMIN_EMAIL=admin@example.com
+      - ADMIN_PASSWORD=admin123
+    networks:
+      - app-network
+
+  service_orders:
+    build: ./service_orders
+    ports:
+      - "8002:8000"
+    environment:
+      - NODE_ENV=development
+      - JWT_SECRET=your-super-secret-jwt-key-change-in-production
+      - USERS_SERVICE_URL=http://service_users:8000
+    networks:
+      - app-network
+    depends_on:
+      - service_users
 
 networks:
-  microservices-network:
+  app-network:
     driver: bridge
