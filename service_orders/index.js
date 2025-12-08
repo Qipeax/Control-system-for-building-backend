@@ -1,523 +1,393 @@
 const express = require('express');
 const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const { v4: uuidv4 } = require('uuid');
+const Joi = require('joi');
 
 const app = express();
 const PORT = process.env.PORT || 8000;
-
-// ========== ШАГ 3: Конфигурация ==========
-const CONFIG = {
-    PORT: process.env.PORT || 8000,
-    DB: {
-        INITIAL_ID: 1
-    },
-    VALIDATION: {
-        MAX_PRODUCT_LENGTH: 255,
-        MIN_QUANTITY: 1,
-        MIN_PRICE: 0
-    },
-    LOGGING: {
-        LEVEL: process.env.LOG_LEVEL || 'info'
-    }
-};
-
-// ========== ШАГ 3: Логирование ==========
-const logger = {
-    info: (message, meta = {}) => {
-        console.log(JSON.stringify({
-            level: 'INFO',
-            timestamp: new Date().toISOString(),
-            message,
-            ...meta
-        }));
-    },
-    
-    error: (message, error = null, meta = {}) => {
-        console.error(JSON.stringify({
-            level: 'ERROR',
-            timestamp: new Date().toISOString(),
-            message,
-            error: error ? error.message : null,
-            stack: error ? error.stack : null,
-            ...meta
-        }));
-    },
-    
-    warn: (message, meta = {}) => {
-        console.warn(JSON.stringify({
-            level: 'WARN',
-            timestamp: new Date().toISOString(),
-            message,
-            ...meta
-        }));
-    }
-};
 
 // Middleware
 app.use(cors());
 app.use(express.json());
 
-// ========== ШАГ 3: Middleware для логирования запросов ==========
-app.use((req, res, next) => {
-    const startTime = Date.now();
-    const requestId = Math.random().toString(36).substr(2, 9);
-    
-    // Сохраняем requestId для использования в логах
-    req.requestId = requestId;
-    
-    logger.info('Request started', {
-        requestId,
-        method: req.method,
-        url: req.url,
-        ip: req.ip
-    });
-    
-    // Перехватываем отправку ответа
-    const originalSend = res.send;
-    res.send = function(data) {
-        const duration = Date.now() - startTime;
-        
-        logger.info('Request completed', {
-            requestId,
-            method: req.method,
-            url: req.url,
-            statusCode: res.statusCode,
-            duration: `${duration}ms`
-        });
-        
-        return originalSend.call(this, data);
-    };
-    
-    next();
+// JWT secret
+const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+
+// In-memory database
+let ordersDb = {};
+let usersServiceUrl = process.env.USERS_SERVICE_URL || 'http://service_users:8000';
+
+// Order statuses
+const ORDER_STATUSES = {
+    CREATED: 'created',
+    IN_PROGRESS: 'in_progress',
+    COMPLETED: 'completed',
+    CANCELLED: 'cancelled'
+};
+
+// Validation schemas
+const createOrderSchema = Joi.object({
+    items: Joi.array().items(
+        Joi.object({
+            productId: Joi.string().required(),
+            name: Joi.string().required(),
+            quantity: Joi.number().integer().min(1).required(),
+            price: Joi.number().positive().required()
+        })
+    ).min(1).required(),
+    totalAmount: Joi.number().positive().required()
 });
 
-// ========== ШАГ 3: Модуль базы данных ==========
-class InMemoryDB {
-    constructor() {
-        this.data = {};
-        this.currentId = CONFIG.DB.INITIAL_ID;
-    }
+const updateOrderSchema = Joi.object({
+    status: Joi.string().valid(...Object.values(ORDER_STATUSES))
+});
 
-    getAll() {
-        return Object.values(this.data);
-    }
+// Helper functions
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-    getById(id) {
-        return this.data[id];
-    }
-
-    create(item) {
-        const id = this.currentId++;
-        const newItem = { id, ...item };
-        this.data[id] = newItem;
-        return newItem;
-    }
-
-    update(id, updates) {
-        if (!this.data[id]) {
-            return null;
-        }
-        this.data[id] = { id, ...updates };
-        return this.data[id];
-    }
-
-    delete(id) {
-        if (!this.data[id]) {
-            return null;
-        }
-        const deletedItem = this.data[id];
-        delete this.data[id];
-        return deletedItem;
-    }
-
-    filterByUserId(userId) {
-        return Object.values(this.data).filter(item => item.userId === userId);
-    }
-
-    count() {
-        return Object.keys(this.data).length;
-    }
-}
-
-// ========== ШАГ 3: Сервисный слой ==========
-class OrdersService {
-    constructor(db) {
-        this.db = db;
-    }
-    
-    getOrder(orderId) {
-        logger.info('Getting order', { orderId });
-        return this.db.getById(orderId);
-    }
-    
-    getAllOrders(userId = null) {
-        logger.info('Getting all orders', { userId: userId || 'none' });
-        
-        if (userId) {
-            return this.db.filterByUserId(userId);
-        }
-        
-        return this.db.getAll();
-    }
-    
-    createOrder(orderData) {
-        logger.info('Creating new order', { orderData });
-        return this.db.create(orderData);
-    }
-    
-    updateOrder(orderId, orderData) {
-        logger.info('Updating order', { orderId, orderData });
-        return this.db.update(orderId, orderData);
-    }
-    
-    deleteOrder(orderId) {
-        logger.info('Deleting order', { orderId });
-        return this.db.delete(orderId);
-    }
-    
-    getStats() {
-        const count = this.db.count();
-        const allOrders = this.db.getAll();
-        
-        const stats = {
-            totalOrders: count,
-            totalValue: allOrders.reduce((sum, order) => sum + (order.price || 0) * (order.quantity || 1), 0),
-            averageOrderValue: count > 0 ? 
-                allOrders.reduce((sum, order) => sum + (order.price || 0), 0) / count : 0
-        };
-        
-        logger.info('Getting service stats', stats);
-        return stats;
-    }
-}
-
-// ========== ШАГ 3: Валидация (обновленная) ==========
-class OrderValidator {
-    static validateOrderData(orderData, isUpdate = false) {
-        const errors = [];
-        
-        if (!isUpdate || orderData.product !== undefined) {
-            if (!orderData.product || typeof orderData.product !== 'string') {
-                errors.push('Product must be a non-empty string');
-            } else if (orderData.product.length > CONFIG.VALIDATION.MAX_PRODUCT_LENGTH) {
-                errors.push(`Product name cannot exceed ${CONFIG.VALIDATION.MAX_PRODUCT_LENGTH} characters`);
-            }
-        }
-        
-        if (!isUpdate || orderData.quantity !== undefined) {
-            if (typeof orderData.quantity !== 'number' || orderData.quantity < CONFIG.VALIDATION.MIN_QUANTITY) {
-                errors.push(`Quantity must be a number >= ${CONFIG.VALIDATION.MIN_QUANTITY}`);
-            }
-        }
-        
-        if (!isUpdate || orderData.price !== undefined) {
-            if (typeof orderData.price !== 'number' || orderData.price < CONFIG.VALIDATION.MIN_PRICE) {
-                errors.push(`Price must be a number >= ${CONFIG.VALIDATION.MIN_PRICE}`);
-            }
-        }
-        
-        if (!isUpdate || orderData.userId !== undefined) {
-            if (typeof orderData.userId !== 'number' || orderData.userId <= 0) {
-                errors.push('userId must be a positive number');
-            }
-        }
-        
-        return errors;
-    }
-    
-    static validateOrderId(orderId) {
-        const errors = [];
-        const id = parseInt(orderId);
-        
-        if (isNaN(id)) {
-            errors.push('Order ID must be a valid number');
-        } else if (id <= 0) {
-            errors.push('Order ID must be a positive number');
-        }
-        
-        return { isValid: errors.length === 0, id, errors };
-    }
-    
-    static validateUserId(userId) {
-        const errors = [];
-        const id = parseInt(userId);
-        
-        if (isNaN(id)) {
-            errors.push('User ID must be a valid number');
-        } else if (id <= 0) {
-            errors.push('User ID must be a positive number');
-        }
-        
-        return { isValid: errors.length === 0, id, errors };
-    }
-}
-
-// ========== ШАГ 3: Контроллер (обновленный) ==========
-class OrdersController {
-    constructor(service) {
-        this.service = service;
-    }
-    
-    getStatus(req, res) {
-        res.json({ 
-            status: 'Orders service is running',
-            timestamp: new Date().toISOString()
+    if (!token) {
+        return res.status(401).json({
+            success: false,
+            error: { code: 'UNAUTHORIZED', message: 'Токен не предоставлен' }
         });
     }
-    
-    getHealth(req, res) {
-        const stats = this.service.getStats();
-        
-        res.json({
+
+    try {
+        const user = jwt.verify(token, JWT_SECRET);
+        req.user = user;
+        next();
+    } catch (error) {
+        return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'Недействительный токен' }
+        });
+    }
+};
+
+const authorizeOrderAccess = (req, res, next) => {
+    const orderId = req.params.orderId || req.body.orderId;
+    const order = ordersDb[orderId];
+
+    if (!order) {
+        return res.status(404).json({
+            success: false,
+            error: { code: 'ORDER_NOT_FOUND', message: 'Заказ не найден' }
+        });
+    }
+
+    // Allow admin to access any order
+    if (req.user.roles.includes('admin')) {
+        req.order = order;
+        return next();
+    }
+
+    // Check if user owns the order
+    if (order.userId !== req.user.id) {
+        return res.status(403).json({
+            success: false,
+            error: { code: 'FORBIDDEN', message: 'Нет доступа к этому заказу' }
+        });
+    }
+
+    req.order = order;
+    next();
+};
+
+// Routes
+// Health check
+app.get('/api/v1/health', (req, res) => {
+    res.json({
+        success: true,
+        data: {
             status: 'OK',
             service: 'Orders Service',
-            timestamp: new Date().toISOString(),
-            dbCount: stats.totalOrders,
-            stats
-        });
-    }
-    
-    getOrder(req, res) {
-        const validation = OrderValidator.validateOrderId(req.params.orderId);
-        
-        if (!validation.isValid) {
-            logger.warn('Invalid order ID', { 
-                requestId: req.requestId,
-                orderId: req.params.orderId,
-                errors: validation.errors 
-            });
-            
-            return res.status(400).json({ 
-                error: 'Invalid order ID', 
-                details: validation.errors 
-            });
+            timestamp: new Date().toISOString()
         }
-        
-        const order = this.service.getOrder(validation.id);
-        
-        if (!order) {
-            logger.warn('Order not found', { 
-                requestId: req.requestId,
-                orderId: validation.id 
-            });
-            
-            return res.status(404).json({ error: 'Order not found' });
-        }
-        
-        res.json(order);
-    }
-    
-    getAllOrders(req, res) {
-        if (req.query.userId) {
-            const validation = OrderValidator.validateUserId(req.query.userId);
-            
-            if (!validation.isValid) {
-                logger.warn('Invalid user ID', { 
-                    requestId: req.requestId,
-                    userId: req.query.userId,
-                    errors: validation.errors 
-                });
-                
-                return res.status(400).json({ 
-                    error: 'Invalid user ID', 
-                    details: validation.errors 
-                });
-            }
-            
-            const orders = this.service.getAllOrders(validation.id);
-            res.json(orders);
-        } else {
-            const orders = this.service.getAllOrders();
-            res.json(orders);
-        }
-    }
-    
-    createOrder(req, res) {
-        const validationErrors = OrderValidator.validateOrderData(req.body);
-        
-        if (validationErrors.length > 0) {
-            logger.warn('Order validation failed', { 
-                requestId: req.requestId,
-                errors: validationErrors,
-                data: req.body 
-            });
-            
-            return res.status(400).json({ 
-                error: 'Validation failed', 
-                details: validationErrors 
-            });
-        }
-        
-        try {
-            const newOrder = this.service.createOrder(req.body);
-            
-            logger.info('Order created successfully', { 
-                requestId: req.requestId,
-                orderId: newOrder.id 
-            });
-            
-            res.status(201).json(newOrder);
-        } catch (error) {
-            logger.error('Failed to create order', error, { 
-                requestId: req.requestId,
-                data: req.body 
-            });
-            
-            res.status(500).json({ error: 'Failed to create order' });
-        }
-    }
-    
-    updateOrder(req, res) {
-        const idValidation = OrderValidator.validateOrderId(req.params.orderId);
-        
-        if (!idValidation.isValid) {
-            logger.warn('Invalid order ID for update', { 
-                requestId: req.requestId,
-                orderId: req.params.orderId,
-                errors: idValidation.errors 
-            });
-            
-            return res.status(400).json({ 
-                error: 'Invalid order ID', 
-                details: idValidation.errors 
-            });
-        }
-        
-        const dataValidationErrors = OrderValidator.validateOrderData(req.body, true);
-        
-        if (dataValidationErrors.length > 0) {
-            logger.warn('Order update validation failed', { 
-                requestId: req.requestId,
-                orderId: idValidation.id,
-                errors: dataValidationErrors 
-            });
-            
-            return res.status(400).json({ 
-                error: 'Validation failed', 
-                details: dataValidationErrors 
-            });
-        }
-        
-        const updatedOrder = this.service.updateOrder(idValidation.id, req.body);
-        
-        if (!updatedOrder) {
-            logger.warn('Order not found for update', { 
-                requestId: req.requestId,
-                orderId: idValidation.id 
-            });
-            
-            return res.status(404).json({ error: 'Order not found' });
-        }
-        
-        logger.info('Order updated successfully', { 
-            requestId: req.requestId,
-            orderId: idValidation.id 
-        });
-        
-        res.json(updatedOrder);
-    }
-    
-    deleteOrder(req, res) {
-        const validation = OrderValidator.validateOrderId(req.params.orderId);
-        
-        if (!validation.isValid) {
-            logger.warn('Invalid order ID for deletion', { 
-                requestId: req.requestId,
-                orderId: req.params.orderId,
-                errors: validation.errors 
-            });
-            
-            return res.status(400).json({ 
-                error: 'Invalid order ID', 
-                details: validation.errors 
-            });
-        }
-        
-        const deletedOrder = this.service.deleteOrder(validation.id);
-        
-        if (!deletedOrder) {
-            logger.warn('Order not found for deletion', { 
-                requestId: req.requestId,
-                orderId: validation.id 
-            });
-            
-            return res.status(404).json({ error: 'Order not found' });
-        }
-        
-        logger.info('Order deleted successfully', { 
-            requestId: req.requestId,
-            orderId: validation.id 
-        });
-        
-        res.json({ 
-            message: 'Order deleted', 
-            deletedOrder
-        });
-    }
-}
-
-// ========== ШАГ 3: Middleware для обработки ошибок ==========
-function asyncHandler(fn) {
-    return async (req, res, next) => {
-        try {
-            await fn(req, res, next);
-        } catch (error) {
-            logger.error('Unhandled error in route handler', error, {
-                requestId: req.requestId,
-                url: req.url,
-                method: req.method
-            });
-            next(error);
-        }
-    };
-}
-
-app.use((error, req, res, next) => {
-    logger.error('Global error handler caught error', error, {
-        requestId: req.requestId,
-        url: req.url,
-        method: req.method
-    });
-    
-    res.status(500).json({
-        error: 'Internal server error',
-        timestamp: new Date().toISOString(),
-        requestId: req.requestId
     });
 });
 
-// ========== ШАГ 3: Инициализация ==========
-const ordersDB = new InMemoryDB();
-const ordersService = new OrdersService(ordersDB);
-const ordersController = new OrdersController(ordersService);
+// Get all orders for current user
+app.get('/api/v1/orders', authenticateToken, (req, res) => {
+    try {
+        const { page = 1, limit = 10, status, sortBy = 'createdAt', sortOrder = 'desc' } = req.query;
+        const pageNum = parseInt(page);
+        const limitNum = parseInt(limit);
 
-// ========== ШАГ 3: Маршруты с asyncHandler ==========
-app.get('/orders/status', asyncHandler((req, res) => ordersController.getStatus(req, res)));
-app.get('/orders/health', asyncHandler((req, res) => ordersController.getHealth(req, res)));
-app.get('/orders/:orderId', asyncHandler((req, res) => ordersController.getOrder(req, res)));
-app.get('/orders', asyncHandler((req, res) => ordersController.getAllOrders(req, res)));
-app.post('/orders', asyncHandler((req, res) => ordersController.createOrder(req, res)));
-app.put('/orders/:orderId', asyncHandler((req, res) => ordersController.updateOrder(req, res)));
-app.delete('/orders/:orderId', asyncHandler((req, res) => ordersController.deleteOrder(req, res)));
+        // Filter orders
+        let filteredOrders = Object.values(ordersDb);
+        
+        // Non-admin users can only see their own orders
+        if (!req.user.roles.includes('admin')) {
+            filteredOrders = filteredOrders.filter(order => order.userId === req.user.id);
+        }
+        
+        if (status) {
+            filteredOrders = filteredOrders.filter(order => order.status === status);
+        }
 
-// ========== ШАГ 3: Обработка 404 ==========
-app.use('*', (req, res) => {
-    logger.warn('Route not found', { 
-        requestId: req.requestId,
-        url: req.originalUrl 
-    });
-    
-    res.status(404).json({
-        error: 'Route not found',
-        path: req.originalUrl,
-        timestamp: new Date().toISOString(),
-        requestId: req.requestId
-    });
+        // Sort orders
+        filteredOrders.sort((a, b) => {
+            const aValue = a[sortBy];
+            const bValue = b[sortBy];
+            const direction = sortOrder === 'asc' ? 1 : -1;
+            
+            if (aValue < bValue) return -1 * direction;
+            if (aValue > bValue) return 1 * direction;
+            return 0;
+        });
+
+        // Pagination
+        const startIndex = (pageNum - 1) * limitNum;
+        const endIndex = pageNum * limitNum;
+        const paginatedOrders = filteredOrders.slice(startIndex, endIndex);
+
+        // Map to response format
+        const ordersData = paginatedOrders.map(order => ({
+            id: order.id,
+            userId: order.userId,
+            items: order.items,
+            status: order.status,
+            totalAmount: order.totalAmount,
+            createdAt: order.createdAt,
+            updatedAt: order.updatedAt
+        }));
+
+        res.json({
+            success: true,
+            data: {
+                orders: ordersData,
+                pagination: {
+                    page: pageNum,
+                    limit: limitNum,
+                    total: filteredOrders.length,
+                    totalPages: Math.ceil(filteredOrders.length / limitNum)
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Get orders error:', error);
+        res.status(500).json({
+            success: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Ошибка при получении заказов' }
+        });
+    }
+});
+
+// Create new order
+app.post('/api/v1/orders', authenticateToken, async (req, res) => {
+    try {
+        // Validate input
+        const { error, value } = createOrderSchema.validate(req.body);
+        if (error) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'VALIDATION_ERROR', message: error.details[0].message }
+            });
+        }
+
+        const { items, totalAmount } = value;
+
+        // Verify total amount matches items
+        const calculatedTotal = items.reduce((sum, item) => sum + (item.price * item.quantity), 0);
+        if (Math.abs(calculatedTotal - totalAmount) > 0.01) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_TOTAL', message: 'Сумма заказа не соответствует позициям' }
+            });
+        }
+
+        // Create order
+        const orderId = uuidv4();
+        const newOrder = {
+            id: orderId,
+            userId: req.user.id,
+            items,
+            status: ORDER_STATUSES.CREATED,
+            totalAmount,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+        };
+
+        ordersDb[orderId] = newOrder;
+
+        // Publish order created event (placeholder for message broker)
+        console.log(`Order created event: ${orderId} for user ${req.user.id}`);
+
+        res.status(201).json({
+            success: true,
+            data: {
+                order: {
+                    id: newOrder.id,
+                    userId: newOrder.userId,
+                    items: newOrder.items,
+                    status: newOrder.status,
+                    totalAmount: newOrder.totalAmount,
+                    createdAt: newOrder.createdAt
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Create order error:', error);
+        res.status(500).json({
+            success: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Ошибка при создании заказа' }
+        });
+    }
+});
+
+// Get order by ID
+app.get('/api/v1/orders/:orderId', authenticateToken, authorizeOrderAccess, (req, res) => {
+    try {
+        res.json({
+            success: true,
+            data: {
+                order: {
+                    id: req.order.id,
+                    userId: req.order.userId,
+                    items: req.order.items,
+                    status: req.order.status,
+                    totalAmount: req.order.totalAmount,
+                    createdAt: req.order.createdAt,
+                    updatedAt: req.order.updatedAt
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Get order error:', error);
+        res.status(500).json({
+            success: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Ошибка при получении заказа' }
+        });
+    }
+});
+
+// Update order (status update)
+app.put('/api/v1/orders/:orderId', authenticateToken, authorizeOrderAccess, (req, res) => {
+    try {
+        // Validate input
+        const { error, value } = updateOrderSchema.validate(req.body);
+        if (error) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'VALIDATION_ERROR', message: error.details[0].message }
+            });
+        }
+
+        const { status } = value;
+
+        // Check if status transition is valid
+        const validTransitions = {
+            [ORDER_STATUSES.CREATED]: [ORDER_STATUSES.IN_PROGRESS, ORDER_STATUSES.CANCELLED],
+            [ORDER_STATUSES.IN_PROGRESS]: [ORDER_STATUSES.COMPLETED, ORDER_STATUSES.CANCELLED],
+            [ORDER_STATUSES.COMPLETED]: [],
+            [ORDER_STATUSES.CANCELLED]: []
+        };
+
+        if (!validTransitions[req.order.status].includes(status)) {
+            return res.status(400).json({
+                success: false,
+                error: { 
+                    code: 'INVALID_STATUS_TRANSITION', 
+                    message: `Невозможно изменить статус с ${req.order.status} на ${status}` 
+                }
+            });
+        }
+
+        // Update order
+        const updatedOrder = {
+            ...req.order,
+            status,
+            updatedAt: new Date().toISOString()
+        };
+
+        ordersDb[req.order.id] = updatedOrder;
+
+        // Publish status updated event
+        console.log(`Order status updated event: ${req.order.id} from ${req.order.status} to ${status}`);
+
+        res.json({
+            success: true,
+            data: {
+                order: {
+                    id: updatedOrder.id,
+                    userId: updatedOrder.userId,
+                    status: updatedOrder.status,
+                    totalAmount: updatedOrder.totalAmount,
+                    createdAt: updatedOrder.createdAt,
+                    updatedAt: updatedOrder.updatedAt
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Update order error:', error);
+        res.status(500).json({
+            success: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Ошибка при обновлении заказа' }
+        });
+    }
+});
+
+// Cancel order
+app.delete('/api/v1/orders/:orderId', authenticateToken, authorizeOrderAccess, (req, res) => {
+    try {
+        // Check if order can be cancelled
+        if (req.order.status === ORDER_STATUSES.COMPLETED) {
+            return res.status(400).json({
+                success: false,
+                error: { 
+                    code: 'ORDER_COMPLETED', 
+                    message: 'Невозможно отменить выполненный заказ' 
+                }
+            });
+        }
+
+        if (req.order.status === ORDER_STATUSES.CANCELLED) {
+            return res.status(400).json({
+                success: false,
+                error: { 
+                    code: 'ORDER_ALREADY_CANCELLED', 
+                    message: 'Заказ уже отменён' 
+                }
+            });
+        }
+
+        // Update order status to cancelled
+        const updatedOrder = {
+            ...req.order,
+            status: ORDER_STATUSES.CANCELLED,
+            updatedAt: new Date().toISOString()
+        };
+
+        ordersDb[req.order.id] = updatedOrder;
+
+        // Publish cancellation event
+        console.log(`Order cancelled event: ${req.order.id}`);
+
+        res.json({
+            success: true,
+            data: {
+                message: 'Заказ успешно отменён',
+                order: {
+                    id: updatedOrder.id,
+                    status: updatedOrder.status,
+                    updatedAt: updatedOrder.updatedAt
+                }
+            }
+        });
+    } catch (error) {
+        console.error('Cancel order error:', error);
+        res.status(500).json({
+            success: false,
+            error: { code: 'INTERNAL_ERROR', message: 'Ошибка при отмене заказа' }
+        });
+    }
 });
 
 // Start server
-app.listen(CONFIG.PORT, () => {
-    logger.info('Orders service started', {
-        port: CONFIG.PORT,
-        environment: process.env.NODE_ENV || 'development'
-    });
+app.listen(PORT, () => {
+    console.log(`Orders service running on port ${PORT}`);
+    console.log('Available order statuses:', Object.values(ORDER_STATUSES));
 });
