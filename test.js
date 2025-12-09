@@ -26,7 +26,7 @@ class TestRunner {
   }
 
   async run() {
-    console.log('🚀 Запуск тестов микросервисной системы...\n');
+    console.log('Запуск тестов\n');
     
     try {
       // Проверяем доступность сервисов
@@ -430,17 +430,7 @@ class TestRunner {
     const successRate = (testResults.passed / testResults.tests.length * 100).toFixed(2);
     console.log(`🎯 Успешность: ${successRate}%`);
     
-    // Определяем оценку
-    let grade = 0;
-    if (testResults.passed >= 18) {
-      grade = 5;
-    } else if (testResults.passed >= 13) {
-      grade = 4;
-    } else if (testResults.passed >= 5) {
-      grade = 3;
-    }
-    
-    console.log(`\n🏆 ПРЕДВАРИТЕЛЬНАЯ ОЦЕНКА: ${grade}`);
+  
     
     console.log('\n📋 Детали тестов:');
     console.log('-'.repeat(60));
@@ -453,18 +443,7 @@ class TestRunner {
       }
     });
     
-    console.log('\n🎯 КРИТЕРИИ ОЦЕНКИ:');
-    console.log('-'.repeat(60));
-    console.log('3️⃣  (5+ тестов): Аутентификация и базовые операции с пользователями');
-    console.log('4️⃣  (13+ тестов): + Полный цикл заказов с пагинацией');
-    console.log('5️⃣  (18+ тестов): + Проверка прав доступа и бизнес-логики');
-    
-    console.log('\n🚀 Рекомендации:');
-    if (grade < 5) {
-      console.log(`⚠️  Для повышения оценки до 5 необходимо исправить ${5 - grade} категорию(и)`);
-    } else {
-      console.log('🎉 Все критерии выполнены! Проект готов к защите.');
-    }
+   
   }
 }
 
