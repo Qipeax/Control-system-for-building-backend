@@ -12,7 +12,7 @@ app.use(cors());
 app.use(express.json());
 
 // JWT secret
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
+const JWT_SECRET = process.env.JWT_SECRET || '88005553535';
 
 // In-memory database
 let ordersDb = {};
